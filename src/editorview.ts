@@ -6,7 +6,7 @@ import {StyleModule, StyleSpec} from "style-mod"
 import {DocView} from "./docview"
 import {ContentView} from "./contentview"
 import {InputState} from "./input"
-import {Rect, focusPreventScroll, flattenRect} from "./dom"
+import {Rect, focusPreventScroll, flattenRect, contentEditablePlainTextSupported} from "./dom"
 import {posAtCoords, moveByChar, moveToLineBoundary, byGroup, moveVertically, skipAtoms} from "./cursor"
 import {BlockInfo} from "./heightmap"
 import {ViewState} from "./viewstate"
@@ -288,9 +288,11 @@ export class EditorView {
   }
 
   /// @internal
-  measure() {
+  measure(flush = true) {
     if (this.measureScheduled > -1) cancelAnimationFrame(this.measureScheduled)
     this.measureScheduled = -1 // Prevent requestMeasure calls from scheduling another animation frame
+
+    if (flush) this.observer.flush()
 
     let updated: ViewUpdate | null = null
     try {
@@ -353,7 +355,7 @@ export class EditorView {
       spellcheck: "false",
       autocorrect: "off",
       autocapitalize: "off",
-      contenteditable: String(this.state.facet(editable)),
+      contenteditable: !this.state.facet(editable) ? "false" : contentEditablePlainTextSupported() ? "plaintext-only" : "true",
       class: "cm-content",
       style: `${browser.tabSize}: ${this.state.tabSize}`,
       role: "textbox",
@@ -381,7 +383,7 @@ export class EditorView {
   private readMeasured() {
     if (this.updateState == UpdateState.Updating)
       throw new Error("Reading the editor layout isn't allowed during an update")
-    if (this.updateState == UpdateState.Idle && this.measureScheduled > -1) this.measure()
+    if (this.updateState == UpdateState.Idle && this.measureScheduled > -1) this.measure(false)
   }
 
   /// Schedule a layout measurement, optionally providing callbacks to
@@ -546,9 +548,11 @@ export class EditorView {
 
   /// Get the document position at the given screen coordinates.
   /// Returns null if no valid position could be found.
-  posAtCoords(coords: {x: number, y: number}): number | null {
+  posAtCoords(coords: {x: number, y: number}, precise: false): number
+  posAtCoords(coords: {x: number, y: number}): number | null
+  posAtCoords(coords: {x: number, y: number}, precise = true): number | null {
     this.readMeasured()
-    return posAtCoords(this, coords)
+    return posAtCoords(this, coords, precise)
   }
 
   /// Get the screen coordinates at the given document position.

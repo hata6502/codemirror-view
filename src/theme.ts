@@ -58,7 +58,6 @@ export const baseTheme = buildTheme("." + baseThemeID, {
     display: "block",
     whiteSpace: "pre",
     wordWrap: "normal", // https://github.com/codemirror/codemirror.next/issues/456
-    WebkitUserModify: "read-write-plaintext-only",
     boxSizing: "border-box",
 
     padding: "4px 0",
@@ -67,6 +66,7 @@ export const baseTheme = buildTheme("." + baseThemeID, {
 
   ".cm-lineWrapping": {
     whiteSpace: "pre-wrap",
+    wordBreak: "break-word", // For Safari, which doesn't support overflow-wrap: anywhere
     overflowWrap: "anywhere"
   },
 
