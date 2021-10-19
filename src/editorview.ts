@@ -6,14 +6,14 @@ import {StyleModule, StyleSpec} from "style-mod"
 import {DocView} from "./docview"
 import {ContentView} from "./contentview"
 import {InputState} from "./input"
-import {Rect, focusPreventScroll, flattenRect, contentEditablePlainTextSupported} from "./dom"
+import {Rect, focusPreventScroll, flattenRect, contentEditablePlainTextSupported, getRoot} from "./dom"
 import {posAtCoords, moveByChar, moveToLineBoundary, byGroup, moveVertically, skipAtoms} from "./cursor"
 import {BlockInfo} from "./heightmap"
 import {ViewState} from "./viewstate"
 import {ViewUpdate, styleModule,
         contentAttributes, editorAttributes, clickAddsSelectionRange, dragMovesSelection, mouseSelectionStyle,
         exceptionSink, updateListener, logException, viewPlugin, ViewPlugin, PluginInstance, PluginField,
-        decorations, MeasureRequest, UpdateFlag, editable, inputHandler} from "./extension"
+        decorations, MeasureRequest, editable, inputHandler, scrollTo, UpdateFlag} from "./extension"
 import {theme, darkTheme, buildTheme, baseThemeID, baseLightID, baseDarkID, lightDarkIDs, baseTheme} from "./theme"
 import {DOMObserver} from "./domobserver"
 import {Attrs, updateAttrs, combineAttrs} from "./attributes"
@@ -27,7 +27,9 @@ interface EditorConfig {
   state?: EditorState,
   /// If the view is going to be mounted in a shadow root or document
   /// other than the one held by the global variable `document` (the
-  /// default), you should pass it here.
+  /// default), you should pass it here. If you provide `parent`, but
+  /// not this option, the editor will automatically look up a root
+  /// from the parent.
   root?: Document | ShadowRoot,
   /// Override the transaction [dispatch
   /// function](#view.EditorView.dispatch) for this editor view, which
@@ -89,7 +91,7 @@ export class EditorView {
   get inView() { return this.viewState.inView }
 
   /// Indicates whether the user is currently composing text via
-  /// [IME](https://developer.mozilla.org/en-US/docs/Mozilla/IME_handling_guide).
+  /// [IME](https://en.wikipedia.org/wiki/Input_method).
   get composing() { return this.inputState.composing > 0 }
   
   private _dispatch: (tr: Transaction) => void
@@ -128,6 +130,8 @@ export class EditorView {
   private styleModules!: readonly StyleModule[]
   private bidiCache: CachedOrder[] = []
 
+  private destroyed = false;
+
   /// @internal
   updateState: UpdateState = UpdateState.Updating
 
@@ -163,7 +167,7 @@ export class EditorView {
 
     this._dispatch = config.dispatch || ((tr: Transaction) => this.update([tr]))
     this.dispatch = this.dispatch.bind(this)
-    this.root = (config.root || document) as DocumentOrShadowRoot
+    this.root = (config.root || getRoot(config.parent) || document) as DocumentOrShadowRoot
 
     this.viewState = new ViewState(config.state || EditorState.create())
     this.plugins = this.state.facet(viewPlugin).map(spec => new PluginInstance(spec).update(this))
@@ -217,16 +221,28 @@ export class EditorView {
         throw new RangeError("Trying to update state with a transaction that doesn't start from the previous state.")
       state = tr.state
     }
+    if (this.destroyed) {
+      this.viewState.state = state
+      return
+    }
+
     // When the phrases change, redraw the editor
     if (state.facet(EditorState.phrases) != this.state.facet(EditorState.phrases))
       return this.setState(state)
 
     update = new ViewUpdate(this, state, transactions)
-    let scrollTo
+    let scrollPos: SelectionRange | null = null
     try {
       this.updateState = UpdateState.Updating
-      scrollTo = transactions.some(tr => tr.scrollIntoView) ? state.selection.main : null
-      this.viewState.update(update, scrollTo)
+      for (let tr of transactions) {
+        if (scrollPos) scrollPos = scrollPos.map(tr.changes)
+        if (tr.scrollIntoView) {
+          let {main} = tr.state.selection
+          scrollPos = main.empty ? main : EditorSelection.cursor(main.head, main.head > main.anchor ? -1 : 1)
+        }
+        for (let e of tr.effects) if (e.is(scrollTo)) scrollPos = e.value
+      }
+      this.viewState.update(update, scrollPos)
       this.bidiCache = CachedOrder.update(this.bidiCache, update.changes)
       if (!update.empty) {
         this.updatePlugins(update)
@@ -237,7 +253,7 @@ export class EditorView {
       this.updateAttrs()
       this.showAnnouncements(transactions)
     } finally { this.updateState = UpdateState.Idle }
-    if (redrawn || scrollTo || this.viewState.mustEnforceCursorAssoc) this.requestMeasure()
+    if (redrawn || scrollPos || this.viewState.mustEnforceCursorAssoc) this.requestMeasure()
     if (!update.empty) for (let listener of this.state.facet(updateListener)) listener(update)
   }
 
@@ -249,6 +265,10 @@ export class EditorView {
   setState(newState: EditorState) {
     if (this.updateState != UpdateState.Idle)
       throw new Error("Calls to EditorView.setState are not allowed while an update is in progress")
+    if (this.destroyed) {
+      this.viewState.state = newState
+      return
+    }
     this.updateState = UpdateState.Updating
     try {
       for (let plugin of this.plugins) plugin.destroy(this)
@@ -289,6 +309,7 @@ export class EditorView {
 
   /// @internal
   measure(flush = true) {
+    if (this.destroyed) return
     if (this.measureScheduled > -1) cancelAnimationFrame(this.measureScheduled)
     this.measureScheduled = -1 // Prevent requestMeasure calls from scheduling another animation frame
 
@@ -298,14 +319,17 @@ export class EditorView {
     try {
       for (let i = 0;; i++) {
         this.updateState = UpdateState.Measuring
+        let oldViewport = this.viewport
         let changed = this.viewState.measure(this.docView, i > 0)
-        let measuring = this.measureRequests
-        if (!changed && !measuring.length && this.viewState.scrollTo == null) break
-        this.measureRequests = []
+        if (!changed && !this.measureRequests.length && this.viewState.scrollTo == null) break
         if (i > 5) {
           console.warn("Viewport failed to stabilize")
           break
         }
+        let measuring: MeasureRequest<any>[] = []
+        // Only run measure requests in this cycle when the viewport didn't change
+        if (!(changed & UpdateFlag.Viewport))
+          [this.measureRequests, measuring] = [measuring, this.measureRequests]
         let measured = measuring.map(m => {
           try { return m.read(this) }
           catch(e) { logException(this.state, e); return BadMeasure }
@@ -326,10 +350,10 @@ export class EditorView {
           catch(e) { logException(this.state, e) }
         }
         if (this.viewState.scrollTo) {
-          this.docView.scrollPosIntoView(this.viewState.scrollTo.head, this.viewState.scrollTo.assoc)
+          this.docView.scrollRangeIntoView(this.viewState.scrollTo)
           this.viewState.scrollTo = null
         }
-        if (!(changed & UpdateFlag.Viewport) && this.measureRequests.length == 0) break
+        if (this.viewport.from == oldViewport.from && this.viewport.to == oldViewport.to && this.measureRequests.length == 0) break
       }
     } finally { this.updateState = UpdateState.Idle }
 
@@ -346,12 +370,11 @@ export class EditorView {
 
   private updateAttrs() {
     let editorAttrs = combineAttrs(this.state.facet(editorAttributes), {
-      // FIXME drop cm-wrap in next major release
-      class: "cm-editor cm-wrap" + (this.hasFocus ? " cm-focused " : " ") + this.themeClasses
+      class: "cm-editor" + (this.hasFocus ? " cm-focused " : " ") + this.themeClasses
     })
     updateAttrs(this.dom, this.editorAttrs, editorAttrs)
     this.editorAttrs = editorAttrs
-    let contentAttrs = combineAttrs(this.state.facet(contentAttributes), {
+    let contentAttrs: Attrs = {
       spellcheck: "false",
       autocorrect: "off",
       autocapitalize: "off",
@@ -360,7 +383,9 @@ export class EditorView {
       style: `${browser.tabSize}: ${this.state.tabSize}`,
       role: "textbox",
       "aria-multiline": "true"
-    })
+    }
+    if (this.state.readOnly) contentAttrs["aria-readonly"] = "true"
+    combineAttrs(this.state.facet(contentAttributes), contentAttrs)
     updateAttrs(this.contentDOM, this.contentAttrs, contentAttrs)
     this.contentAttrs = contentAttrs
   }
@@ -628,11 +653,17 @@ export class EditorView {
   /// calling this.
   destroy() {
     for (let plugin of this.plugins) plugin.destroy(this)
+    this.plugins = []
     this.inputState.destroy()
     this.dom.remove()
     this.observer.destroy()
     if (this.measureScheduled > -1) cancelAnimationFrame(this.measureScheduled)
+    this.destroyed = true
   }
+
+  /// Effect that can be [added](#state.TransactionSpec.effects) to a
+  /// transaction to make it scroll the given range into view.
+  static scrollTo = scrollTo
 
   /// Facet to add a [style
   /// module](https://github.com/marijnh/style-mod#documentation) to
@@ -673,12 +704,12 @@ export class EditorView {
   /// every time the view updates.
   static updateListener = updateListener
 
-  /// Facet that controls whether the editor content is editable. When
-  /// its highest-precedence value is `false`, editing is disabled,
-  /// and the content element will no longer have its
-  /// `contenteditable` attribute set to `true`. (Note that this
-  /// doesn't affect API calls that change the editor content, even
-  /// when those are bound to keys or buttons.)
+  /// Facet that controls whether the editor content DOM is editable.
+  /// When its highest-precedence value is `false`, the element will
+  /// not longer have its `contenteditable` attribute set. (Note that
+  /// this doesn't affect API calls that change the editor content,
+  /// even when those are bound to keys or buttons. See the
+  /// [`readOnly`](#state.EditorState.readOnly) facet for that.)
   static editable = editable
 
   /// Allows you to influence the way mouse selection happens. The

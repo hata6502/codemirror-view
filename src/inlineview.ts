@@ -1,5 +1,5 @@
 import {Text as DocText} from "@codemirror/text"
-import {ContentView, DOMPos} from "./contentview"
+import {ContentView, DOMPos, Dirty} from "./contentview"
 import {WidgetType, MarkDecoration} from "./decoration"
 import {Rect, Rect0, flattenRect, textRange, clientRectsFor} from "./dom"
 import {CompositionWidget} from "./docview"
@@ -66,7 +66,9 @@ export class TextView extends InlineView {
   }
 
   slice(from: number) {
-    return new TextView(this.text.slice(from))
+    let result = new TextView(this.text.slice(from))
+    this.text = this.text.slice(0, from)
+    return result
   }
 
   localPosFromDOM(node: Node, offset: number): number {
@@ -102,7 +104,7 @@ export class MarkView extends InlineView {
   }
 
   sync(track?: {node: Node, written: boolean}) {
-    if (!this.dom) this.createDOM()
+    if (!this.dom || (this.dirty & Dirty.Attrs)) this.createDOM()
     super.sync(track)
   }
 
@@ -116,7 +118,18 @@ export class MarkView extends InlineView {
   }
 
   slice(from: number) {
-    return new MarkView(this.mark, sliceInlineChildren(this.children, from), this.length - from)
+    let result = [], off = 0, detachFrom = -1, i = 0
+    for (let elt of this.children) {
+      let end = off + elt.length
+      if (end > from) result.push(off < from ? elt.slice(from - off) : elt)
+      if (detachFrom < 0 && off >= from) detachFrom = i
+      off = end
+      i++
+    }
+    let length = this.length - from
+    this.length = from
+    if (detachFrom > -1) this.replaceChildren(detachFrom, this.children.length)
+    return new MarkView(this.mark, result, length)
   }
 
   domAtPos(pos: number): DOMPos {
@@ -159,7 +172,11 @@ export class WidgetView extends InlineView {
     super()
   }
 
-  slice(from: number) { return WidgetView.create(this.widget, this.length - from, this.side) }
+  slice(from: number) {
+    let result = WidgetView.create(this.widget, this.length - from, this.side)
+    this.length -= from
+    return result
+  }
 
   sync() {
     if (!this.dom || !this.widget.updateDOM(this.dom)) {
@@ -215,6 +232,8 @@ export class WidgetView extends InlineView {
     }
     return (pos == 0 && side > 0 || pos == this.length && side <= 0) ? rect : flattenRect(rect, pos == 0)
   }
+
+  get isEditable() { return false }
 }
 
 export class CompositionView extends WidgetView {
@@ -233,6 +252,45 @@ export class CompositionView extends WidgetView {
   get overrideDOMText() { return null }
 
   coordsAt(pos: number, side: number) { return textCoords(this.widget.text, pos, side) }
+
+  get isEditable() { return true }
+}
+
+// These are drawn around uneditable widgets to avoid a number of
+// browser bugs that show up when the cursor is directly next to
+// uneditable inline content.
+export class WidgetBufferView extends InlineView {
+  constructor(readonly side: number) { super() }
+
+  get length() { return 0 }
+
+  merge() { return false }
+
+  become(other: InlineView): boolean {
+    return other instanceof WidgetBufferView && other.side == this.side
+  }
+
+  slice() { return new WidgetBufferView(this.side) }
+
+  sync() {
+    if (!this.dom) this.setDOM(document.createTextNode("\u200b"))
+    else if (this.dirty && this.dom.nodeValue != "\u200b") this.dom.nodeValue = "\u200b"
+  }
+
+  getSide() { return this.side }
+
+  domAtPos(pos: number) { return DOMPos.before(this.dom!) }
+
+  domBoundsAround() { return null }
+
+  coordsAt(pos: number): Rect {
+    let rects = clientRectsFor(this.dom!)
+    return rects[rects.length - 1]
+  }
+
+  get overrideDOMText() {
+    return DocText.of([this.dom!.nodeValue!.replace(/\u200b/g, "")])
+  }
 }
 
 export function mergeInlineChildren(parent: ContentView & {children: InlineView[]},
@@ -246,7 +304,7 @@ export function mergeInlineChildren(parent: ContentView & {children: InlineView[
   parent.length += dLen
 
   let {children} = parent
-  // Both from and to point into the same text view
+  // Both from and to point into the same child view
   if (fromI == toI && fromOff) {
     let start = children[fromI]
     // Maybe just update that view and be done
@@ -306,22 +364,12 @@ export function mergeInlineChildren(parent: ContentView & {children: InlineView[
     fromI++
     openStart = elts.length ? 0 : openEnd
   }
-  if (!elts.length && fromI && toI < children.length && openStart && openEnd &&
+  if (!elts.length && fromI && toI < children.length &&
       children[toI].merge(0, 0, children[fromI - 1], openStart, openEnd))
     fromI--
 
   // And if anything remains, splice the child array to insert the new elts
   if (elts.length || fromI != toI) parent.replaceChildren(fromI, toI, elts)
-}
-
-export function sliceInlineChildren(children: readonly InlineView[], from: number) {
-  let result = [], off = 0
-  for (let elt of children) {
-    let end = off + elt.length
-    if (end > from) result.push(off < from ? elt.slice(from - off) : elt)
-    off = end
-  }
-  return result
 }
 
 export function inlineDOMAtPos(dom: HTMLElement, children: readonly InlineView[], pos: number) {
@@ -355,10 +403,17 @@ export function joinInlineInto(parent: ContentView, view: InlineView, open: numb
 
 export function coordsInChildren(view: ContentView & {children: InlineView[]}, pos: number, side: number): Rect | null {
   for (let off = 0, i = 0; i < view.children.length; i++) {
-    let child = view.children[i], end = off + child.length
-    if (end == off && child.getSide() <= 0) continue
-    if (side <= 0 || end == view.length ? end >= pos : end > pos)
-      return child.coordsAt(pos - off, side)
+    let child = view.children[i], end = off + child.length, next
+    if ((side <= 0 || end == view.length || child.getSide() > 0 ? end >= pos : end > pos) &&
+        (pos < end || i + 1 == view.children.length || (next = view.children[i + 1]).length || next.getSide() > 0)) {
+      let flatten = 0
+      if (end == off) {
+        if (child.getSide() <= 0) continue
+        flatten = side = -child.getSide()
+      }
+      let rect = child.coordsAt(pos - off, side)
+      return flatten && rect ? flattenRect(rect, side < 0) : rect
+    }
     off = end
   }
   let last = view.dom!.lastChild

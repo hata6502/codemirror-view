@@ -1,6 +1,7 @@
-import {ContentView, DOMPos} from "./contentview"
+import {ContentView, DOMPos, Dirty} from "./contentview"
 import {DocView} from "./docview"
-import {InlineView, TextView, WidgetView, mergeInlineChildren, inlineDOMAtPos, joinInlineInto, coordsInChildren} from "./inlineview"
+import {InlineView, TextView, MarkView,
+        mergeInlineChildren, inlineDOMAtPos, joinInlineInto, coordsInChildren} from "./inlineview"
 import {clientRectsFor, Rect} from "./dom"
 import {LineDecoration, WidgetType, BlockType} from "./decoration"
 import {Attrs, combineAttrs, attrsEq, updateAttrs} from "./attributes"
@@ -86,7 +87,7 @@ export class LineView extends ContentView implements BlockView {
   }
 
   sync(track?: {node: Node, written: boolean}) {
-    if (!this.dom) {
+    if (!this.dom || (this.dirty & Dirty.Attrs)) {
       this.setDOM(document.createElement("div"))
       this.dom!.className = "cm-line"
       this.prevAttrs = this.attrs ? null : undefined
@@ -98,8 +99,10 @@ export class LineView extends ContentView implements BlockView {
     }
     super.sync(track)
     let last = this.dom!.lastChild
+    while (last && ContentView.get(last) instanceof MarkView)
+      last = last.lastChild
     if (!last ||
-        last.nodeName != "BR" && ContentView.get(last) instanceof WidgetView &&
+        last.nodeName != "BR" && ContentView.get(last)?.isEditable == false &&
         (!browser.ios || !this.children.some(ch => ch instanceof TextView))) {
       let hack = document.createElement("BR")
       ;(hack as any).cmIgnore = true

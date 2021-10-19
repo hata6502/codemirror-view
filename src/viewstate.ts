@@ -167,14 +167,11 @@ export class ViewState {
     let viewport = heightChanges.length ? this.mapViewport(this.viewport, update.changes) : this.viewport
     if (scrollTo && (scrollTo.head < viewport.from || scrollTo.head > viewport.to) || !this.viewportIsAppropriate(viewport))
       viewport = this.getViewport(0, scrollTo)
-    if (!viewport.eq(this.viewport)) {
-      this.viewport = viewport
-      update.flags |= UpdateFlag.Viewport
-    }
+    this.viewport = viewport
     this.updateForViewport()
     if (this.lineGaps.length || this.viewport.to - this.viewport.from > LG.MinViewPort)
-      update.flags |= this.updateLineGaps(this.ensureLineGaps(this.mapLineGaps(this.lineGaps, update.changes)))
-    this.computeVisibleRanges()
+      this.updateLineGaps(this.ensureLineGaps(this.mapLineGaps(this.lineGaps, update.changes)))
+    update.flags |= this.computeVisibleRanges()
 
     if (scrollTo) this.scrollTo = scrollTo
 
@@ -186,12 +183,18 @@ export class ViewState {
   measure(docView: DocView, repeated: boolean) {
     let dom = docView.dom, whiteSpace = "", direction: Direction = Direction.LTR
 
+    let result = 0
+
     if (!repeated) {
       // Vertical padding
       let style = window.getComputedStyle(dom)
       whiteSpace = style.whiteSpace!, direction = (style.direction == "rtl" ? Direction.RTL : Direction.LTR) as any
-      this.paddingTop = parseInt(style.paddingTop!) || 0
-      this.paddingBottom = parseInt(style.paddingBottom!) || 0
+      let paddingTop = parseInt(style.paddingTop!) || 0, paddingBottom = parseInt(style.paddingBottom!) || 0
+      if (this.paddingTop != paddingTop || this.paddingBottom != paddingBottom) {
+        result |= UpdateFlag.Geometry
+        this.paddingTop = paddingTop
+        this.paddingBottom = paddingBottom
+      }
     }
 
     // Pixel viewport
@@ -203,7 +206,7 @@ export class ViewState {
     if (!this.inView) return 0
 
     let lineHeights = docView.measureVisibleLineHeights()
-    let refresh = false, bias = 0, result = 0, oracle = this.heightOracle
+    let refresh = false, bias = 0, oracle = this.heightOracle
 
     if (!repeated) {
       let contentWidth = docView.dom.clientWidth
@@ -231,17 +234,13 @@ export class ViewState {
 
     if (oracle.heightChanged) result |= UpdateFlag.Height
     if (!this.viewportIsAppropriate(this.viewport, bias) ||
-        this.scrollTo && (this.scrollTo.head < this.viewport.from || this.scrollTo.head > this.viewport.to)) {
-      let newVP = this.getViewport(bias, this.scrollTo)
-      if (newVP.from != this.viewport.from || newVP.to != this.viewport.to) {
-        this.viewport = newVP
-        result |= UpdateFlag.Viewport
-      }
-    }
+        this.scrollTo && (this.scrollTo.head < this.viewport.from || this.scrollTo.head > this.viewport.to))
+      this.viewport = this.getViewport(bias, this.scrollTo)
+
     this.updateForViewport()
     if (this.lineGaps.length || this.viewport.to - this.viewport.from > LG.MinViewPort)
-      result |= this.updateLineGaps(this.ensureLineGaps(refresh ? [] : this.lineGaps))
-    this.computeVisibleRanges()
+      this.updateLineGaps(this.ensureLineGaps(refresh ? [] : this.lineGaps))
+    result |= this.computeVisibleRanges()
 
     if (this.mustEnforceCursorAssoc) {
       this.mustEnforceCursorAssoc = false
@@ -365,9 +364,7 @@ export class ViewState {
     if (!LineGap.same(gaps, this.lineGaps)) {
       this.lineGaps = gaps
       this.lineGapDeco = Decoration.set(gaps.map(gap => gap.draw(this.heightOracle.lineWrapping)))
-      return UpdateFlag.LineGaps
     }
-    return 0
   }
 
   computeVisibleRanges() {
@@ -378,7 +375,10 @@ export class ViewState {
       span(from, to) { ranges.push({from, to}) },
       point() {}
     }, 20)
+    let changed = ranges.length != this.visibleRanges.length ||
+      this.visibleRanges.some((r, i) => r.from != ranges[i].from || r.to != ranges[i].to)
     this.visibleRanges = ranges
+    return changed ? UpdateFlag.Viewport : 0
   }
 
   lineAt(pos: number, editorTop: number): BlockInfo {
@@ -414,11 +414,8 @@ export class ViewState {
   }
 }
 
-/// Indicates the range of the document that is in the visible
-/// viewport.
 export class Viewport {
   constructor(readonly from: number, readonly to: number) {}
-  eq(b: Viewport) { return this.from == b.from && this.to == b.to }
 }
 
 function lineStructure(from: number, to: number, state: EditorState) {

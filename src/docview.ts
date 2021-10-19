@@ -1,7 +1,7 @@
 import {RangeSet} from "@codemirror/rangeset"
-import {ChangeSet, Transaction} from "@codemirror/state"
+import {ChangeSet, SelectionRange} from "@codemirror/state"
 import {ContentView, ChildCursor, Dirty, DOMPos} from "./contentview"
-import {BlockView, LineView} from "./blockview"
+import {BlockView, LineView, BlockWidgetView} from "./blockview"
 import {InlineView, CompositionView} from "./inlineview"
 import {ContentBuilder} from "./buildview"
 import browser from "./browser"
@@ -79,9 +79,9 @@ export class DocView extends ContentView {
     let decoDiff = findChangedDeco(prevDeco, deco, update.changes)
     changedRanges = ChangedRange.extendWithRanges(changedRanges, decoDiff)
 
-    let pointerSel = update.transactions.some(tr => tr.annotation(Transaction.userEvent) == "pointerselection")
+    let pointerSel = update.transactions.some(tr => tr.isUserEvent("select.pointer"))
     if (this.dirty == Dirty.Not && changedRanges.length == 0 &&
-        !(update.flags & (UpdateFlag.Viewport | UpdateFlag.LineGaps)) &&
+        !(update.flags & UpdateFlag.Viewport) &&
         update.state.selection.main.from >= this.view.viewport.from &&
         update.state.selection.main.to <= this.view.viewport.to) {
       this.updateSelection(forceSelection, pointerSel)
@@ -90,6 +90,14 @@ export class DocView extends ContentView {
       this.updateInner(changedRanges, deco, update.startState.doc.length, forceSelection, pointerSel)
       return true
     }
+  }
+
+  reset(sel: boolean) {
+    if (this.dirty) {
+      this.view.observer.ignore(() => this.view.docView.sync())
+      this.dirty = Dirty.Not
+    }
+    if (sel) this.updateSelection()
   }
 
   // Used both by update and checkLayout do perform the actual DOM
@@ -117,6 +125,10 @@ export class DocView extends ContentView {
       this.updateSelection(forceSelection, pointerSel)
       this.dom.style.height = ""
     })
+    let gaps = []
+    if (this.view.viewport.from || this.view.viewport.to < this.view.state.doc.length) for (let child of this.children)
+      if (child instanceof BlockWidgetView && child.widget instanceof BlockGapWidget) gaps.push(child.dom!)
+    observer.updateGaps(gaps)
   }
 
   private updateChildren(changes: readonly ChangedRange[], deco: readonly DecorationSet[], oldLength: number) {
@@ -143,7 +155,7 @@ export class DocView extends ContentView {
 
     let after = this.children[toI]
     // Make sure the end of the line after the update is preserved in `after`
-    if (toOff < after.length || after.children.length && after.children[after.children.length - 1].length == 0) {
+    if (toOff < after.length) {
       // If we're splitting a line, separate part of the start line to
       // avoid that being mangled when updating the start line.
       if (fromI == toI) {
@@ -157,7 +169,7 @@ export class DocView extends ContentView {
       } else {
         // Remove the start of the after element, if necessary, and
         // add it to `content`.
-        if (toOff || after.children.length && after.children[0].length == 0) after.merge(0, toOff, null, false, 0, openEnd)
+        if (toOff) after.merge(0, toOff, null, false, 0, openEnd)
         content.push(after)
       }
     } else if (after.breakAfter) {
@@ -258,7 +270,7 @@ export class DocView extends ContentView {
     let cursor = this.view.state.selection.main
     let sel = getSelection(this.root)
     if (!cursor.empty || !cursor.assoc || !sel.modify) return
-    let line = LineView.find(this, cursor.head) // FIXME provide view-line-range finding helper
+    let line = LineView.find(this, cursor.head)
     if (!line) return
     let lineStart = line.posAtStart
     if (cursor.head == lineStart || cursor.head == lineStart + line.length) return
@@ -386,9 +398,13 @@ export class DocView extends ContentView {
     ]
   }
 
-  scrollPosIntoView(pos: number, side: number) {
-    let rect = this.coordsAt(pos, side)
+  scrollRangeIntoView(range: SelectionRange) {
+    let rect = this.coordsAt(range.head, range.empty ? range.assoc : range.head > range.anchor ? -1 : 1), other
     if (!rect) return
+    if (!range.empty && (other = this.coordsAt(range.anchor, range.anchor > range.head ? -1 : 1)))
+      rect = {left: Math.min(rect.left, other.left), top: Math.min(rect.top, other.top),
+              right: Math.max(rect.right, other.right), bottom: Math.max(rect.bottom, other.bottom)}
+
     let mLeft = 0, mRight = 0, mTop = 0, mBottom = 0
     for (let margins of this.view.pluginField(PluginField.scrollMargins)) if (margins) {
       let {left, right, top, bottom} = margins
@@ -400,7 +416,7 @@ export class DocView extends ContentView {
     scrollRectIntoView(this.dom, {
       left: rect.left - mLeft, top: rect.top - mTop,
       right: rect.right + mRight, bottom: rect.bottom + mBottom
-    })
+    }, range.head < range.anchor ? -1 : 1)
   }
 }
 

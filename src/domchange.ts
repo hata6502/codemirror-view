@@ -3,12 +3,12 @@ import {ContentView} from "./contentview"
 import {inputHandler, editable} from "./extension"
 import {contains, dispatchKey} from "./dom"
 import browser from "./browser"
-import {EditorSelection, Transaction, Annotation, Text} from "@codemirror/state"
+import {EditorSelection, Text} from "@codemirror/state"
 
 export function applyDOMChange(view: EditorView, start: number, end: number, typeOver: boolean) {
   let change: undefined | {from: number, to: number, insert: Text}, newSel
   let sel = view.state.selection.main, bounds
-  if (start > -1 && (bounds = view.docView.domBoundsAround(start, end, 0))) {
+  if (start > -1 && !view.state.readOnly && (bounds = view.docView.domBoundsAround(start, end, 0))) {
     let {from, to} = bounds
     let selPoints = view.docView.impreciseHead || view.docView.impreciseAnchor ? [] : selectionPoints(view)
     let reader = new DOMReader(selPoints, view)
@@ -71,9 +71,9 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
          (change.from == sel.from - 1 && change.to == sel.to && change.insert.length == 0 &&
           dispatchKey(view.contentDOM, "Backspace", 8)) ||
          (change.from == sel.from && change.to == sel.to + 1 && change.insert.length == 0 &&
-          dispatchKey(view.contentDOM, "Delete", 46))) ||
-        browser.ios && view.inputState.flushIOSKey(view))
+          dispatchKey(view.contentDOM, "Delete", 46)))) {
       return
+    }
 
     let text = change.insert.toString()
     if (view.state.facet(inputHandler).some(h => h(view, change!.from, change!.to, text)))
@@ -95,14 +95,22 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
           ? startState.selection.replaceRange(newSel.main) : undefined
       }
     }
-    view.dispatch(tr, {scrollIntoView: true, annotations: Transaction.userEvent.of("input")})
-  } else if (newSel && !newSel.main.eq(sel)) {
-    let scrollIntoView = false, annotations: Annotation<any> | undefined
-    if (view.inputState.lastSelectionTime > Date.now() - 50) {
-      if (view.inputState.lastSelectionOrigin == "keyboardselection") scrollIntoView = true
-      else annotations = Transaction.userEvent.of(view.inputState.lastSelectionOrigin!)
+    let userEvent = "input.type"
+    if (view.composing) {
+      userEvent += ".compose"
+      if (view.inputState.compositionFirstChange) {
+        userEvent += ".start"
+        view.inputState.compositionFirstChange = false
+      }
     }
-    view.dispatch({selection: newSel, scrollIntoView, annotations})
+    view.dispatch(tr, {scrollIntoView: true, userEvent})
+  } else if (newSel && !newSel.main.eq(sel)) {
+    let scrollIntoView = false, userEvent = "select"
+    if (view.inputState.lastSelectionTime > Date.now() - 50) {
+      if (view.inputState.lastSelectionOrigin == "select") scrollIntoView = true
+      userEvent = view.inputState.lastSelectionOrigin!
+    }
+    view.dispatch({selection: newSel, scrollIntoView, userEvent})
   }
 }
 
@@ -150,8 +158,9 @@ class DOMReader {
       let next: Node | null = cur.nextSibling
       if (next == end) break
       let view = ContentView.get(cur), nextView = ContentView.get(next!)
-      if ((view ? view.breakAfter : isBlockElement(cur)) ||
-          ((nextView ? nextView.breakAfter : isBlockElement(next!)) && !(cur.nodeName == "BR" && !(cur as any).cmIgnore)))
+      if (view && nextView ? view.breakAfter :
+          (view ? view.breakAfter : isBlockElement(cur)) ||
+          (isBlockElement(next!) && (cur.nodeName != "BR" || (cur as any).cmIgnore)))
         this.text += this.lineBreak
       cur = next!
     }

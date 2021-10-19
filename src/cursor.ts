@@ -2,7 +2,6 @@ import {EditorState, EditorSelection, SelectionRange, CharCategory} from "@codem
 import {findColumn, findClusterBreak} from "@codemirror/text"
 import {EditorView} from "./editorview"
 import {BlockType} from "./decoration"
-import {WidgetView} from "./inlineview"
 import {LineView} from "./blockview"
 import {PluginField} from "./extension"
 import {clientRectsFor, textRange, Rect} from "./dom"
@@ -41,10 +40,6 @@ export function groupAt(state: EditorState, pos: number, bias: 1 | -1 = 1) {
 // Search the DOM for the {node, offset} position closest to the given
 // coordinates. Very inefficient and crude, but can usually be avoided
 // by calling caret(Position|Range)FromPoint instead.
-
-// FIXME holding arrow-up/down at the end of the viewport is a rather
-// common use case that will repeatedly trigger this code. Maybe
-// introduce some element of binary search after all?
 
 function getdx(x: number, rect: ClientRect): number {
   return rect.left > x ? rect.left - x : Math.max(0, x - rect.right)
@@ -142,24 +137,26 @@ export function posAtCoords(view: EditorView, {x, y}: {x: number, y: number}, pr
     y = bias > 0 ? block.bottom + halfLine : block.top - halfLine
   }
   let lineStart = block.from
+  // Clip x to the viewport sides
   x = Math.max(content.left + 1, Math.min(content.right - 1, x))
   // If this is outside of the rendered viewport, we can't determine a position
   if (lineStart < view.viewport.from)
     return view.viewport.from == 0 ? 0 : posAtCoordsImprecise(view, content, block, x, y)
   if (lineStart > view.viewport.to)
     return view.viewport.to == view.state.doc.length ? view.state.doc.length : posAtCoordsImprecise(view, content, block, x, y)
-  // Clip x to the viewport sides
-  let root = view.root, element = root.elementFromPoint(x, y)
+  // Prefer ShadowRootOrDocument.elementFromPoint if present, fall back to document if not
+  let doc = view.dom.ownerDocument
+  let element = ((view.root as any).elementFromPoint ? view.root as Document : doc).elementFromPoint(x, y)
 
   // There's visible editor content under the point, so we can try
   // using caret(Position|Range)FromPoint as a shortcut
   let node: Node | undefined, offset: number = -1
-  if (element && view.contentDOM.contains(element) && !(view.docView.nearest(element) instanceof WidgetView)) {
-    if (root.caretPositionFromPoint) {
-      let pos = root.caretPositionFromPoint(x, y)
+  if (element && view.contentDOM.contains(element) && view.docView.nearest(element)?.isEditable != false) {
+    if (doc.caretPositionFromPoint) {
+      let pos = doc.caretPositionFromPoint(x, y)
       if (pos) ({offsetNode: node, offset} = pos)
-    } else if (root.caretRangeFromPoint) {
-      let range = root.caretRangeFromPoint(x, y)
+    } else if (doc.caretRangeFromPoint) {
+      let range = doc.caretRangeFromPoint(x, y)
       if (range) {
         ;({startContainer: node, startOffset: offset} = range)
         if (browser.safari && isSuspiciousCaretResult(node, offset, x)) node = undefined

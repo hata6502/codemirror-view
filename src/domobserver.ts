@@ -8,6 +8,7 @@ const observeOptions = {
   childList: true,
   characterData: true,
   subtree: true,
+  attributes: true,
   characterDataOldValue: true
 }
 
@@ -31,6 +32,8 @@ export class DOMObserver {
   scrollTargets: HTMLElement[] = []
   intersection: IntersectionObserver | null = null
   intersecting: boolean = false
+  gapIntersection: IntersectionObserver | null = null
+  gaps: readonly HTMLElement[] = []
 
   // Used to work around a Safari Selection/shadow DOM bug (#414)
   _selectionRange: SelectionRange | null = null
@@ -78,13 +81,17 @@ export class DOMObserver {
     if (typeof IntersectionObserver == "function") {
       this.intersection = new IntersectionObserver(entries => {
         if (this.parentCheck < 0) this.parentCheck = setTimeout(this.listenForScroll.bind(this), 1000)
-        if (entries[entries.length - 1].intersectionRatio > 0 != this.intersecting) {
+        if (entries.length > 0 && entries[entries.length - 1].intersectionRatio > 0 != this.intersecting) {
           this.intersecting = !this.intersecting
           if (this.intersecting != this.view.inView)
             this.onScrollChanged(document.createEvent("Event"))
         }
       }, {})
       this.intersection.observe(this.dom)
+      this.gapIntersection = new IntersectionObserver(entries => {
+        if (entries.length > 0 && entries[entries.length - 1].intersectionRatio > 0)
+          this.onScrollChanged(document.createEvent("Event"));
+      }, {})
     }
     this.listenForScroll()
   }
@@ -92,6 +99,14 @@ export class DOMObserver {
   onScroll(e: Event) {
     if (this.intersecting) this.flush()
     this.onScrollChanged(e)
+  }
+
+  updateGaps(gaps: readonly HTMLElement[]) {
+    if (this.gapIntersection && (gaps.length != this.gaps.length || this.gaps.some((g, i) => g != gaps[i]))) {
+      this.gapIntersection.disconnect()
+      for (let gap of gaps) this.gapIntersection.observe(gap)
+      this.gaps = gaps
+    }
   }
 
   onSelectionChange(event: Event) {
@@ -206,18 +221,10 @@ export class DOMObserver {
     }
   }
 
-  // Apply pending changes, if any
-  flush() {
-    if (this.delayedFlush >= 0) return
-
-    this.lastFlush = Date.now()
+  processRecords() {
     let records = this.queue
     for (let mut of this.observer.takeRecords()) records.push(mut)
     if (records.length) this.queue = []
-
-    let selection = this.selectionRange
-    let newSel = !this.ignoreSelection.eq(selection) && hasSelection(this.dom, selection)
-    if (records.length == 0 && !newSel) return
 
     let from = -1, to = -1, typeOver = false
     for (let record of records) {
@@ -231,38 +238,52 @@ export class DOMObserver {
         to = Math.max(range.to, to)
       }
     }
+    return {from, to, typeOver}
+  }
+
+  // Apply pending changes, if any
+  flush() {
+    // Completely hold off flushing when pending keys are set—the code
+    // managing those will make sure processRecords is called and the
+    // view is resynchronized after
+    if (this.delayedFlush >= 0 || this.view.inputState.pendingKey) return
+
+    this.lastFlush = Date.now()
+    let {from, to, typeOver} = this.processRecords()
+    let selection = this.selectionRange
+    let newSel = !this.ignoreSelection.eq(selection) && hasSelection(this.dom, selection)
+    if (from < 0 && !newSel) return
 
     let startState = this.view.state
-    if (from > -1 || newSel) this.onChange(from, to, typeOver)
-    if (this.view.state == startState) { // The view wasn't updated
-      if (this.view.docView.dirty) {
-        this.ignore(() => this.view.docView.sync())
-        this.view.docView.dirty = Dirty.Not
-      }
-      if (newSel)
-        this.view.docView.updateSelection()
-    }
+    this.onChange(from, to, typeOver)
+    
+    // The view wasn't updated
+    if (this.view.state == startState) this.view.docView.reset(newSel)
     this.clearSelection()
   }
 
   readMutation(rec: MutationRecord): {from: number, to: number, typeOver: boolean} | null {
     let cView = this.view.docView.nearest(rec.target)
     if (!cView || cView.ignoreMutation(rec)) return null
-    cView.markDirty()
+    cView.markDirty(rec.type == "attributes")
+    if (rec.type == "attributes") cView.dirty |= Dirty.Attrs
 
     if (rec.type == "childList") {
       let childBefore = findChild(cView, rec.previousSibling || rec.target.previousSibling, -1)
       let childAfter = findChild(cView, rec.nextSibling || rec.target.nextSibling, 1)
       return {from: childBefore ? cView.posAfter(childBefore) : cView.posAtStart,
               to: childAfter ? cView.posBefore(childAfter) : cView.posAtEnd, typeOver: false}
-    } else { // "characterData"
+    } else if (rec.type == "characterData") {
       return {from: cView.posAtStart, to: cView.posAtEnd, typeOver: rec.target.nodeValue == rec.oldValue}
+    } else {
+      return null
     }
   }
 
   destroy() {
     this.stop()
     if (this.intersection) this.intersection.disconnect()
+    if (this.gapIntersection) this.gapIntersection.disconnect()
     for (let dom of this.scrollTargets) dom.removeEventListener("scroll", this.onScroll)
     window.removeEventListener("scroll", this.onScroll)
     clearTimeout(this.parentCheck)

@@ -1,9 +1,9 @@
-import {EditorSelection, EditorState, SelectionRange, Transaction} from "@codemirror/state"
+import {EditorSelection, EditorState, SelectionRange} from "@codemirror/state"
 import {EditorView, DOMEventHandlers} from "./editorview"
 import {ContentView} from "./contentview"
 import {LineView} from "./blockview"
 import {domEventHandlers, ViewUpdate, PluginValue, clickAddsSelectionRange, dragMovesSelection as dragBehavior,
-        logException, mouseSelectionStyle, editable} from "./extension"
+        logException, mouseSelectionStyle} from "./extension"
 import browser from "./browser"
 import {groupAt} from "./cursor"
 import {getSelection, focusPreventScroll, Rect, dispatchKey} from "./dom"
@@ -12,7 +12,25 @@ import {getSelection, focusPreventScroll, Rect, dispatchKey} from "./dom"
 export class InputState {
   lastKeyCode: number = 0
   lastKeyTime: number = 0
-  pendingIOSKey: null | "enter" | "backspace" = null
+
+  // On iOS, some keys need to have their default behavior happen
+  // (after which we retroactively handle them and reset the DOM) to
+  // avoid messing up the virtual keyboard state.
+  //
+  // On Chrome Android, backspace near widgets is just completely
+  // broken, and there are no key events, so we need to handle the
+  // beforeinput event. Deleting stuff will often create a flurry of
+  // events, and interrupting it before it is done just makes
+  // subsequent events even more broken, so again, we hold off doing
+  // anything until the browser is finished with whatever it is trying
+  // to do.
+  //
+  // setPendingKey sets this, causing the DOM observer to pause for a
+  // bit, and setting an animation frame (which seems the most
+  // reliable way to detect 'browser is done flailing') to fire a fake
+  // key event and re-sync the view again.
+  pendingKey: undefined | {key: string, keyCode: number} = undefined
+
   lastSelectionOrigin: string | null = null
   lastSelectionTime: number = 0
   lastEscPress: number = 0
@@ -30,6 +48,11 @@ export class InputState {
   // avoid treating the start state of the composition, before any
   // changes have been made, as part of the composition.
   composing = -1
+  // Tracks whether the next change should be marked as starting the
+  // composition (null means no composition, true means next is the
+  // first, false means first has already been marked for this
+  // composition)
+  compositionFirstChange: boolean | null = null
   compositionEndedAt = 0
   rapidCompositionStart = false
 
@@ -115,20 +138,26 @@ export class InputState {
     // state. So we let it go through, and then, in
     // applyDOMChange, notify key handlers of it and reset to
     // the state they produce.
-    if (browser.ios && (event.keyCode == 13 || event.keyCode == 8) &&
+    let pending
+    if (browser.ios && (pending = PendingKeys.find(key => key.keyCode == event.keyCode)) &&
         !(event.ctrlKey || event.altKey || event.metaKey) && !(event as any).synthetic) {
-      this.pendingIOSKey = event.keyCode == 13 ? "enter" : "backspace"
-      setTimeout(() => this.flushIOSKey(view), 250)
+      this.setPendingKey(view, pending)
       return true
     }
     return false
   }
 
-  flushIOSKey(view: EditorView) {
-    if (!this.pendingIOSKey) return false
-    let dom = view.contentDOM, key = this.pendingIOSKey
-    this.pendingIOSKey = null
-    return key == "enter" ? dispatchKey(dom, "Enter", 13) : dispatchKey(dom, "Backspace", 8)
+  setPendingKey(view: EditorView, pending: {key: string, keyCode: number}) {
+    this.pendingKey = pending
+    requestAnimationFrame(() => {
+      if (!this.pendingKey) return false
+      let key = this.pendingKey
+      this.pendingKey = undefined
+      view.observer.processRecords()
+      let startState = view.state
+      dispatchKey(view.contentDOM, key.key, key.keyCode)
+      if (view.state == startState) view.docView.reset(true)
+    })
   }
 
   ignoreDuringComposition(event: Event): boolean {
@@ -173,6 +202,12 @@ export class InputState {
     if (this.mouseSelection) this.mouseSelection.destroy()
   }
 }
+
+const PendingKeys = [
+  {key: "Backspace", keyCode: 8, inputType: "deleteContentBackward"},
+  {key: "Enter", keyCode: 13, inputType: "insertParagraph"},
+  {key: "Delete", keyCode: 46, inputType: "deleteContentForward"}
+]
 
 // Key codes for modifier keys
 export const modifierCodes = [16, 17, 18, 20, 91, 92, 224, 225]
@@ -257,7 +292,7 @@ class MouseSelection {
     if (!selection.eq(this.view.state.selection) || selection.main.assoc != this.view.state.selection.main.assoc)
       this.view.dispatch({
         selection,
-        annotations: Transaction.userEvent.of("pointerselection"),
+        userEvent: "select.pointer",
         scrollIntoView: true
       })
   }
@@ -327,7 +362,7 @@ function capturePaste(view: EditorView) {
 function doPaste(view: EditorView, input: string) {
   let {state} = view, changes, i = 1, text = state.toText(input)
   let byLine = text.lines == state.selection.ranges.length
-  let linewise = lastLinewiseCopy && state.selection.ranges.every(r => r.empty) && lastLinewiseCopy == text.toString()
+  let linewise = lastLinewiseCopy != null && state.selection.ranges.every(r => r.empty) && lastLinewiseCopy == text.toString()
   if (linewise) {
     let lastLine = -1
     changes = state.changeByRange(range => {
@@ -348,24 +383,24 @@ function doPaste(view: EditorView, input: string) {
     changes = state.replaceSelection(text)
   }
   view.dispatch(changes, {
-    annotations: Transaction.userEvent.of("paste"),
+    userEvent: "input.paste",
     scrollIntoView: true
   })
 }
 
 handlers.keydown = (view, event: KeyboardEvent) => {
-  view.inputState.setSelectionOrigin("keyboardselection")
+  view.inputState.setSelectionOrigin("select")
 }
 
 let lastTouch = 0
 
 handlers.touchstart = (view, e) => {
   lastTouch = Date.now()
-  view.inputState.setSelectionOrigin("pointerselection")
+  view.inputState.setSelectionOrigin("select.pointer")
 }
 
 handlers.touchmove = view => {
-  view.inputState.setSelectionOrigin("pointerselection")
+  view.inputState.setSelectionOrigin("select.pointer")
 }
 
 handlers.mousedown = (view, event: MouseEvent) => {
@@ -497,12 +532,13 @@ function dropText(view: EditorView, event: DragEvent, text: string, direct: bool
   view.dispatch({
     changes,
     selection: {anchor: changes.mapPos(dropPos, -1), head: changes.mapPos(dropPos, 1)},
-    annotations: Transaction.userEvent.of("drop")
+    userEvent: del ? "move.drop" : "input.drop"
   })
 }
 
 handlers.drop = (view, event: DragEvent) => {
-  if (!event.dataTransfer || !view.state.facet(editable)) return
+  if (!event.dataTransfer) return
+  if (view.state.readOnly) return event.preventDefault()
 
   let files = event.dataTransfer.files
   if (files && files.length) { // For a file drop, read the file's text.
@@ -527,12 +563,11 @@ handlers.drop = (view, event: DragEvent) => {
 }
 
 handlers.paste = (view: EditorView, event: ClipboardEvent) => {
-  if (!view.state.facet(editable)) return
+  if (view.state.readOnly) return event.preventDefault()
   view.observer.flush()
   let data = brokenClipboardAPI ? null : event.clipboardData
-  let text = data && data.getData("text/plain")
-  if (text) {
-    doPaste(view, text)
+  if (data) {
+    doPaste(view, data.getData("text/plain"))
     event.preventDefault()
   } else {
     capturePaste(view)
@@ -583,7 +618,7 @@ let lastLinewiseCopy: string | null = null
 
 handlers.copy = handlers.cut = (view, event: ClipboardEvent) => {
   let {text, ranges, linewise} = copiedRange(view.state)
-  if (!text) return
+  if (!text && !linewise) return
   lastLinewiseCopy = linewise ? text : null
 
   let data = brokenClipboardAPI ? null : event.clipboardData
@@ -594,11 +629,11 @@ handlers.copy = handlers.cut = (view, event: ClipboardEvent) => {
   } else {
     captureCopy(view, text)
   }
-  if (event.type == "cut" && view.state.facet(editable))
+  if (event.type == "cut" && !view.state.readOnly)
     view.dispatch({
       changes: ranges,
       scrollIntoView: true,
-      annotations: Transaction.userEvent.of("cut")
+      userEvent: "delete.cut"
     })
 }
 
@@ -626,6 +661,8 @@ function forceClearComposition(view: EditorView, rapid: boolean) {
 }
 
 handlers.compositionstart = handlers.compositionupdate = view => {
+  if (view.inputState.compositionFirstChange == null)
+    view.inputState.compositionFirstChange = true
   if (view.inputState.composing < 0) {
     if (view.docView.compositionDeco.size) {
       view.observer.flush()
@@ -639,6 +676,7 @@ handlers.compositionstart = handlers.compositionupdate = view => {
 handlers.compositionend = view => {
   view.inputState.composing = -1
   view.inputState.compositionEndedAt = Date.now()
+  view.inputState.compositionFirstChange = null
   setTimeout(() => {
     if (view.inputState.composing < 0) forceClearComposition(view, false)
   }, 50)
@@ -646,4 +684,28 @@ handlers.compositionend = view => {
 
 handlers.contextmenu = view => {
   view.inputState.lastContextMenu = Date.now()
+}
+
+handlers.beforeinput = (view, event) => {
+  // Because Chrome Android doesn't fire useful key events, use
+  // beforeinput to detect backspace (and possibly enter and delete,
+  // but those usually don't even seem to fire beforeinput events at
+  // the moment) and fake a key event for it.
+  //
+  // (preventDefault on beforeinput, though supported in the spec,
+  // seems to do nothing at all on Chrome).
+  let pending
+  if (browser.chrome && browser.android && (pending = PendingKeys.find(key => key.inputType == event.inputType))) {
+    view.inputState.setPendingKey(view, pending)
+    let startViewHeight = window.visualViewport?.height || 0
+    setTimeout(() => {
+      // Backspacing near uneditable nodes on Chrome Android sometimes
+      // closes the virtual keyboard. This tries to crudely detect
+      // that and refocus to get it back.
+      if ((window.visualViewport?.height || 0) > startViewHeight + 10 && view.hasFocus) {
+        view.contentDOM.blur()
+        view.focus()
+      }
+    }, 50)
+  }
 }

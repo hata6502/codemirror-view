@@ -1,3 +1,73 @@
+## 0.19.9 (2021-10-01)
+
+### Bug fixes
+
+Fix an issue where some kinds of reflows in the surrounding document could move unrendered parts of the editor into view without the editor noticing and updating its viewport.
+
+Fix an occasional crash in the selection drawing extension.
+
+## 0.19.8 (2021-09-26)
+
+### Bug fixes
+
+Fix a bug that could, on DOM changes near block widgets, insert superfluous line breaks.
+
+Make interacting with a destroyed editor view do nothing, rather than crash, to avoid tripping people up with pending timeouts and such.
+
+Make sure `ViewUpdate.viewportChanged` is true whenever `visibleRanges` changes, so that plugins acting only on visible ranges can use it to check when to update.
+
+Fix line-wise cut on empty lines.
+
+## 0.19.7 (2021-09-13)
+
+### Bug fixes
+
+The view is now aware of the new `EditorState.readOnly` property, and suppresses events that modify the document when it is true.
+
+## 0.19.6 (2021-09-10)
+
+### Bug fixes
+
+Remove a `console.log` that slipped into the previous release.
+
+## 0.19.5 (2021-09-09)
+
+### New features
+
+The new `EditorView.scrollTo` effect can be used to scroll a given range into view.
+
+## 0.19.4 (2021-09-01)
+
+### Bug fixes
+
+Fix an issue where lines containing just a widget decoration wrapped in a mark decoration could be displayed with 0 height.
+
+## 0.19.3 (2021-08-25)
+
+### Bug fixes
+
+Fix a view corruption that could happen in situations involving overlapping mark decorations.
+
+## 0.19.2 (2021-08-23)
+
+### New features
+
+The package now exports a `scrollPastEnd` function, which returns an extension that adds space below the document to allow the last line to be scrolled to the top of the editor.
+
+## 0.19.1 (2021-08-11)
+
+### Breaking changes
+
+The view now emits new-style user event annotations for the transactions it generates.
+
+### Bug fixes
+
+Fix a bug where `coordsAtPos` would allow the passed `side` argument to override widget sides, producing incorrect cursor positions.
+
+Fix a bug that could cause content lines to be misaligned in certain situations involving widgets at the end of lines.
+
+Fix an issue where, if the browser decided to modify DOM attributes in the content in response to some editing action, the view failed to reset those again.
+
 ## 0.18.19 (2021-07-12)
 
 ### Bug fixes

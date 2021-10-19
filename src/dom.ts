@@ -1,5 +1,14 @@
 export function getSelection(root: DocumentOrShadowRoot): Selection {
-  return (root.getSelection ? root.getSelection() : document.getSelection())!
+  let target
+  // Browsers differ on whether shadow roots have a getSelection
+  // method. If it exists, use that, otherwise, call it on the
+  // document.
+  if ((root as any).nodeType == 11) { // Shadow root
+    target = (root as any).getSelection ? root as Document : (root as ShadowRoot).ownerDocument
+  } else {
+    target = root as Document
+  }
+  return target.getSelection()!
 }
 
 export type SelectionRange = {
@@ -98,12 +107,12 @@ function windowRect(win: Window): Rect {
 
 const ScrollSpace = 5
 
-export function scrollRectIntoView(dom: HTMLElement, rect: Rect) {
+export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1) {
   let doc = dom.ownerDocument!, win = doc.defaultView!
 
   for (let cur: any = dom.parentNode; cur;) {
     if (cur.nodeType == 1) { // Element
-      let bounding: Rect, top = cur == document.body
+      let bounding: Rect, top = cur == doc.body
       if (top) {
         bounding = windowRect(win)
       } else {
@@ -118,14 +127,24 @@ export function scrollRectIntoView(dom: HTMLElement, rect: Rect) {
       }
 
       let moveX = 0, moveY = 0
-      if (rect.top < bounding.top)
+      if (rect.top < bounding.top) {
         moveY = -(bounding.top - rect.top + ScrollSpace)
-      else if (rect.bottom > bounding.bottom)
+        if (side > 0 && rect.bottom > bounding.bottom + moveY)
+          moveY = rect.bottom - bounding.bottom + moveY + ScrollSpace
+      } else if (rect.bottom > bounding.bottom) {
         moveY = rect.bottom - bounding.bottom + ScrollSpace
-      if (rect.left < bounding.left)
+        if (side < 0 && (rect.top - moveY) < bounding.top)
+          moveY = -(bounding.top + moveY - rect.top + ScrollSpace)
+      }
+      if (rect.left < bounding.left) {
         moveX = -(bounding.left - rect.left + ScrollSpace)
-      else if (rect.right > bounding.right)
+        if (side > 0 && rect.right > bounding.right + moveX)
+          moveX = rect.right - bounding.right + moveX + ScrollSpace
+      } else if (rect.right > bounding.right) {
         moveX = rect.right - bounding.right + ScrollSpace
+        if (side < 0 && rect.left < bounding.left + moveX)
+          moveX = -(bounding.left + moveX - rect.left + ScrollSpace)
+      }
       if (moveX || moveY) {
         if (top) {
           win.scrollBy(moveX, moveY)
@@ -230,4 +249,13 @@ export function contentEditablePlainTextSupported() {
     } catch(_) {}
   }
   return _plainTextSupported
+}
+
+export function getRoot(node: Node | null | undefined): DocumentOrShadowRoot | null {
+  while (node) {
+    node = (node as HTMLElement).assignedSlot || node.parentNode
+    if (node && (node.nodeType == 9 || node.nodeType == 11 && (node as ShadowRoot).host))
+      return node as unknown as DocumentOrShadowRoot
+  }
+  return null
 }
